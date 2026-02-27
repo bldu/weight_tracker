@@ -6,19 +6,134 @@ import 'dart:math';
 import 'package:crypto/crypto.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:google_sign_in/google_sign_in.dart';
 import 'package:http/http.dart' as http;
+import 'package:http/io_client.dart';
 import 'package:intl/intl.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
 
-void main() {
+late final http.Client _httpClient;
+
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await SystemProxyConfig.load();
+  _httpClient = _createHttpClient();
   runApp(const WeightTrackerApp());
 }
 
 class AppConfig {
   static const clientId = String.fromEnvironment('GOOGLE_CLIENT_ID');
   static const clientSecret = String.fromEnvironment('GOOGLE_CLIENT_SECRET');
+  static const httpProxy = String.fromEnvironment('HTTP_PROXY');
+  static const httpsProxy = String.fromEnvironment('HTTPS_PROXY');
+  static const noProxy = String.fromEnvironment('NO_PROXY');
+}
+
+class SystemProxyConfig {
+  static const _channel = MethodChannel('weight_tracker/proxy');
+
+  static String? httpProxy;
+  static String? httpsProxy;
+  static String? noProxy;
+
+  static Future<void> load() async {
+    if (kIsWeb || !Platform.isMacOS) {
+      return;
+    }
+
+    try {
+      final data = await _channel.invokeMapMethod<String, dynamic>(
+        'getSystemProxy',
+      );
+      if (data == null) {
+        return;
+      }
+
+      final httpEnabled = data['httpEnabled'] == true;
+      final httpHost = data['httpHost'] as String?;
+      final httpPort = data['httpPort'] as int?;
+      if (httpEnabled && httpHost != null && httpHost.isNotEmpty && httpPort != null) {
+        httpProxy = 'http://$httpHost:$httpPort';
+      }
+
+      final httpsEnabled = data['httpsEnabled'] == true;
+      final httpsHost = data['httpsHost'] as String?;
+      final httpsPort = data['httpsPort'] as int?;
+      if (httpsEnabled &&
+          httpsHost != null &&
+          httpsHost.isNotEmpty &&
+          httpsPort != null) {
+        httpsProxy = 'http://$httpsHost:$httpsPort';
+      }
+
+      final exceptions =
+          (data['exceptions'] as List<dynamic>? ?? <dynamic>[])
+              .whereType<String>()
+              .where((e) => e.trim().isNotEmpty)
+              .toSet();
+      exceptions.add('localhost');
+      exceptions.add('127.0.0.1');
+      noProxy = exceptions.join(',');
+    } catch (_) {
+      // Ignore and continue without system proxy.
+    }
+  }
+}
+
+String? _pickProxyValue(List<String?> values) {
+  for (final value in values) {
+    if (value != null && value.trim().isNotEmpty) {
+      return value;
+    }
+  }
+  return null;
+}
+
+http.Client _createHttpClient() {
+  if (kIsWeb) {
+    return http.Client();
+  }
+
+  final environment = Map<String, String>.from(Platform.environment);
+  final effectiveHttpProxy = _pickProxyValue(<String?>[
+    AppConfig.httpProxy,
+    environment['http_proxy'],
+    environment['HTTP_PROXY'],
+    SystemProxyConfig.httpProxy,
+  ]);
+  final effectiveHttpsProxy = _pickProxyValue(<String?>[
+    AppConfig.httpsProxy,
+    environment['https_proxy'],
+    environment['HTTPS_PROXY'],
+    SystemProxyConfig.httpsProxy,
+  ]);
+  final effectiveNoProxy = _pickProxyValue(<String?>[
+    AppConfig.noProxy,
+    environment['no_proxy'],
+    environment['NO_PROXY'],
+    SystemProxyConfig.noProxy,
+  ]);
+
+  if (effectiveHttpProxy != null) {
+    environment['http_proxy'] = effectiveHttpProxy;
+    environment['HTTP_PROXY'] = effectiveHttpProxy;
+  }
+  if (effectiveHttpsProxy != null) {
+    environment['https_proxy'] = effectiveHttpsProxy;
+    environment['HTTPS_PROXY'] = effectiveHttpsProxy;
+  }
+  if (effectiveNoProxy != null) {
+    environment['no_proxy'] = effectiveNoProxy;
+    environment['NO_PROXY'] = effectiveNoProxy;
+  }
+
+  final ioHttpClient = HttpClient();
+  ioHttpClient.findProxy = (uri) {
+    return HttpClient.findProxyFromEnvironment(uri, environment: environment);
+  };
+  return IOClient(ioHttpClient);
 }
 
 class WeightEntry {
@@ -130,31 +245,60 @@ class GoogleAuthService {
     }
 
     try {
-      final req = await server.first.timeout(const Duration(minutes: 5));
-      final code = req.uri.queryParameters['code'];
-      final returnedState = req.uri.queryParameters['state'];
-      final error = req.uri.queryParameters['error'];
+      final callbackPath = '/oauth2callback';
+      final iterator = StreamIterator<HttpRequest>(server);
+      final deadline = DateTime.now().add(const Duration(minutes: 5));
 
-      final responseHtml = (error == null && code != null)
-          ? '<html><body><h3>Sign-in complete</h3><p>You can close this window.</p></body></html>'
-          : '<html><body><h3>Sign-in failed</h3><p>$error</p></body></html>';
+      String? code;
+      while (true) {
+        final remaining = deadline.difference(DateTime.now());
+        if (remaining.isNegative) {
+          throw TimeoutException('OAuth callback timed out.');
+        }
 
-      req.response
-        ..statusCode = 200
-        ..headers.contentType = ContentType.html
-        ..write(responseHtml);
-      await req.response.close();
+        final hasRequest = await iterator.moveNext().timeout(remaining);
+        if (!hasRequest) {
+          throw Exception(
+            'Google sign-in failed: callback server closed unexpectedly.',
+          );
+        }
 
-      if (error != null) {
-        throw Exception('Google sign-in failed: $error');
+        final req = iterator.current;
+        if (req.uri.path != callbackPath) {
+          req.response
+            ..statusCode = 404
+            ..headers.contentType = ContentType.text
+            ..write('Not found');
+          await req.response.close();
+          continue;
+        }
+
+        final returnedState = req.uri.queryParameters['state'];
+        final error = req.uri.queryParameters['error'];
+        code = req.uri.queryParameters['code'];
+
+        final responseHtml = (error == null && code != null)
+            ? '<html><body><h3>Sign-in complete</h3><p>You can close this window.</p></body></html>'
+            : '<html><body><h3>Sign-in failed</h3><p>${error ?? 'Invalid response'}</p></body></html>';
+
+        req.response
+          ..statusCode = 200
+          ..headers.contentType = ContentType.html
+          ..write(responseHtml);
+        await req.response.close();
+
+        if (error != null) {
+          throw Exception('Google sign-in failed: $error');
+        }
+        if (code == null || returnedState != state) {
+          throw Exception(
+            'Google sign-in failed: invalid authorization response.',
+          );
+        }
+        break;
       }
-      if (code == null || returnedState != state) {
-        throw Exception(
-          'Google sign-in failed: invalid authorization response.',
-        );
-      }
 
-      final tokenResponse = await http.post(
+      final tokenResponse = await _httpClient.post(
         _tokenUri,
         headers: {'Content-Type': 'application/x-www-form-urlencoded'},
         body: {
@@ -179,13 +323,18 @@ class GoogleAuthService {
         refreshToken: tokenData['refresh_token'] as String?,
         expiresInSeconds: (tokenData['expires_in'] as num?)?.toInt(),
       );
+    } on TimeoutException {
+      throw Exception(
+        'Google sign-in timed out waiting for local callback at $redirectUri. '
+        'If you use a proxy, bypass proxy for localhost and 127.0.0.1.',
+      );
     } finally {
       await server.close(force: true);
     }
   }
 
   Future<AuthResult> refreshAccessToken(String refreshToken) async {
-    final tokenResponse = await http.post(
+    final tokenResponse = await _httpClient.post(
       _tokenUri,
       headers: {'Content-Type': 'application/x-www-form-urlencoded'},
       body: {
@@ -287,7 +436,7 @@ class GoogleDriveWeightRepository {
   );
 
   Future<String?> _getFileId(String accessToken) async {
-    final response = await http.get(
+    final response = await _httpClient.get(
       _findFileUri,
       headers: {'Authorization': 'Bearer $accessToken'},
     );
@@ -314,7 +463,7 @@ class GoogleDriveWeightRepository {
     final contentUri = Uri.parse(
       'https://www.googleapis.com/drive/v3/files/$fileId?alt=media',
     );
-    final response = await http.get(
+    final response = await _httpClient.get(
       contentUri,
       headers: {'Authorization': 'Bearer $accessToken'},
     );
@@ -361,7 +510,7 @@ class GoogleDriveWeightRepository {
           '$payload\r\n'
           '--$boundary--';
 
-      final response = await http.post(
+      final response = await _httpClient.post(
         createUri,
         headers: {
           'Authorization': 'Bearer $accessToken',
@@ -379,7 +528,7 @@ class GoogleDriveWeightRepository {
     final updateUri = Uri.parse(
       'https://www.googleapis.com/upload/drive/v3/files/$fileId?uploadType=media',
     );
-    final response = await http.patch(
+    final response = await _httpClient.patch(
       updateUri,
       headers: {
         'Authorization': 'Bearer $accessToken',
