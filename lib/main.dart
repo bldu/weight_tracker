@@ -6,6 +6,7 @@ import 'dart:math';
 import 'package:crypto/crypto.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:google_sign_in/google_sign_in.dart';
 import 'package:http/http.dart' as http;
 import 'package:intl/intl.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -209,6 +210,36 @@ class GoogleAuthService {
   }
 }
 
+class AndroidGoogleAuthService {
+  static const _scope = 'https://www.googleapis.com/auth/drive.appdata';
+  final GoogleSignIn _googleSignIn = GoogleSignIn(scopes: <String>[_scope]);
+
+  Future<AuthResult> signIn() async {
+    final account =
+        await _googleSignIn.signInSilently() ?? await _googleSignIn.signIn();
+    if (account == null) {
+      throw Exception('Google sign-in was cancelled.');
+    }
+    final auth = await account.authentication;
+    final token = auth.accessToken;
+    if (token == null || token.isEmpty) {
+      throw Exception('Could not obtain Google access token.');
+    }
+    return AuthResult(accessToken: token);
+  }
+
+  Future<String?> getAccessTokenSilently() async {
+    final account = await _googleSignIn.signInSilently();
+    if (account == null) {
+      return null;
+    }
+    final auth = await account.authentication;
+    return auth.accessToken;
+  }
+
+  Future<void> signOut() => _googleSignIn.signOut();
+}
+
 class SessionStore {
   static const _kAccessToken = 'google_access_token';
   static const _kRefreshToken = 'google_refresh_token';
@@ -387,6 +418,7 @@ class WeightTrackerPage extends StatefulWidget {
 
 class _WeightTrackerPageState extends State<WeightTrackerPage> {
   final _authService = GoogleAuthService();
+  final _androidAuthService = AndroidGoogleAuthService();
   final _repo = GoogleDriveWeightRepository();
   final _sessionStore = SessionStore();
   final _weightController = TextEditingController();
@@ -427,6 +459,15 @@ class _WeightTrackerPageState extends State<WeightTrackerPage> {
       _error = null;
     });
     try {
+      if (!kIsWeb && Platform.isAndroid) {
+        final token = await _androidAuthService.getAccessTokenSilently();
+        if (token != null && token.isNotEmpty) {
+          _accessToken = token;
+          await _reloadFromGoogleDrive();
+        }
+        return;
+      }
+
       final existing = await _sessionStore.read();
       if (existing == null) {
         return;
@@ -470,19 +511,24 @@ class _WeightTrackerPageState extends State<WeightTrackerPage> {
     });
 
     try {
-      final auth = await _authService.signInWithPkce(
-        onManualOpenRequired: (url) {
-          if (!mounted) {
-            return;
-          }
-          setState(() {
-            _manualAuthUrl = url;
-          });
-        },
-      );
-      final session = _toSession(auth);
-      _accessToken = session.accessToken;
-      await _sessionStore.write(session);
+      if (!kIsWeb && Platform.isAndroid) {
+        final auth = await _androidAuthService.signIn();
+        _accessToken = auth.accessToken;
+      } else {
+        final auth = await _authService.signInWithPkce(
+          onManualOpenRequired: (url) {
+            if (!mounted) {
+              return;
+            }
+            setState(() {
+              _manualAuthUrl = url;
+            });
+          },
+        );
+        final session = _toSession(auth);
+        _accessToken = session.accessToken;
+        await _sessionStore.write(session);
+      }
       await _reloadFromGoogleDrive();
     } catch (e) {
       setState(() {
@@ -496,7 +542,14 @@ class _WeightTrackerPageState extends State<WeightTrackerPage> {
   }
 
   Future<void> _reloadFromGoogleDrive() async {
-    if (_accessToken == null) {
+    if (!kIsWeb && Platform.isAndroid) {
+      final refreshed = await _androidAuthService.getAccessTokenSilently();
+      if (refreshed != null && refreshed.isNotEmpty) {
+        _accessToken = refreshed;
+      }
+    }
+
+    if (_accessToken == null || _accessToken!.isEmpty) {
       return;
     }
     setState(() {
@@ -528,7 +581,14 @@ class _WeightTrackerPageState extends State<WeightTrackerPage> {
       });
       return;
     }
-    if (_accessToken == null) {
+    if (!kIsWeb && Platform.isAndroid) {
+      final refreshed = await _androidAuthService.getAccessTokenSilently();
+      if (refreshed != null && refreshed.isNotEmpty) {
+        _accessToken = refreshed;
+      }
+    }
+
+    if (_accessToken == null || _accessToken!.isEmpty) {
       setState(() {
         _error = 'Sign in to Google Drive first.';
       });
@@ -557,7 +617,11 @@ class _WeightTrackerPageState extends State<WeightTrackerPage> {
   }
 
   Future<void> _signOut() async {
-    await _sessionStore.clear();
+    if (!kIsWeb && Platform.isAndroid) {
+      await _androidAuthService.signOut();
+    } else {
+      await _sessionStore.clear();
+    }
     setState(() {
       _accessToken = null;
       _entries = <WeightEntry>[];
